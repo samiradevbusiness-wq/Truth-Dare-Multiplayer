@@ -1,0 +1,172 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function roomPath(roomId) {
+      return /databases/$(database)/documents/rooms/$(roomId);
+    }
+
+    function memberPath(roomId, uid) {
+      return /databases/$(database)/documents/rooms/$(roomId)/members/$(uid);
+    }
+
+    function isMember(roomId) {
+      return signedIn() && exists(memberPath(roomId, request.auth.uid));
+    }
+
+    function isHost(roomId) {
+      return isMember(roomId) && get(roomPath(roomId)).data.hostUid == request.auth.uid;
+    }
+
+    function isPlayer(roomId) {
+      return isMember(roomId) && get(memberPath(roomId, request.auth.uid)).data.role == 'player';
+    }
+
+    function notBlockedByEitherUser(otherUid) {
+      return !exists(/databases/$(database)/documents/users/$(request.auth.uid)/blocks/$(otherUid))
+        && !exists(/databases/$(database)/documents/users/$(otherUid)/blocks/$(request.auth.uid));
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn() && request.auth.uid == uid
+        && !('friendId' in request.resource.data);
+      allow update: if signedIn() && request.auth.uid == uid
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['friendId']);
+      allow delete: if false;
+
+      match /blocks/{blockedUid} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        allow create: if signedIn() && request.auth.uid == uid && blockedUid != uid
+          && request.resource.data.keys().hasOnly(['createdAt']);
+        allow delete: if signedIn() && request.auth.uid == uid;
+        allow update: if false;
+      }
+
+      match /privateAnswers/{answerId} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        allow create: if signedIn() && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['roomId', 'content', 'createdAt'])
+          && request.resource.data.content is string
+          && request.resource.data.content.size() <= 2000;
+        allow update, delete: if false;
+      }
+
+      match /invitations/{roomId} {
+        allow read, delete: if signedIn() && request.auth.uid == uid;
+        allow create: if signedIn()
+          && isPlayer(roomId)
+          && notBlockedByEitherUser(uid)
+          && request.resource.data.keys().hasOnly(['roomId', 'roomName', 'hostUid', 'createdAt'])
+          && request.resource.data.hostUid == request.auth.uid;
+        allow update: if false;
+      }
+    }
+
+    match /rooms/{roomId} {
+      allow create: if signedIn()
+        && request.resource.data.hostUid == request.auth.uid
+        && request.resource.data.roomCode == roomId
+        && request.resource.data.keys().hasOnly(['roomCode', 'hostUid', 'name', 'status', 'allowListeners', 'spectatorModeEnabled', 'createdAt'])
+        && request.resource.data.name is string
+        && request.resource.data.status in ['waiting', 'active', 'ended']
+        && request.resource.data.allowListeners is bool
+        && request.resource.data.spectatorModeEnabled is bool;
+      allow get: if signedIn() && (
+        isMember(roomId)
+        || resource.data.roomCode == roomId
+        || exists(/databases/$(database)/documents/users/$(request.auth.uid)/invitations/$(roomId))
+      );
+      allow list: if isMember(roomId);
+      allow update: if isHost(roomId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'status', 'allowListeners', 'spectatorModeEnabled'])
+        && request.resource.data.status in ['waiting', 'active', 'ended']
+        && request.resource.data.allowListeners is bool
+        && request.resource.data.spectatorModeEnabled is bool;
+      allow delete: if isHost(roomId);
+
+      match /members/{uid} {
+        allow read: if isMember(roomId);
+        allow create: if signedIn()
+          && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['uid', 'displayName', 'role', 'joinedAt'])
+          && request.resource.data.uid == uid
+          && request.resource.data.role in ['player', 'listener']
+          && get(roomPath(roomId)).data.status != 'ended'
+          && !exists(/databases/$(database)/documents/rooms/$(roomId)/bans/$(uid))
+          && notBlockedByEitherUser(get(roomPath(roomId)).data.hostUid)
+          && (
+            (get(roomPath(roomId)).data.hostUid == uid && request.resource.data.role == 'player')
+            || exists(/databases/$(database)/documents/users/$(uid)/invitations/$(roomId))
+            || (get(roomPath(roomId)).data.roomCode == roomId)
+          )
+          && (request.resource.data.role != 'listener' || get(roomPath(roomId)).data.allowListeners == true || get(roomPath(roomId)).data.spectatorModeEnabled == true);
+        allow update: if signedIn() && request.auth.uid == uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName']);
+        allow delete: if signedIn() && (request.auth.uid == uid || isHost(roomId));
+
+        match /sharedEvents/{eventId} {
+          allow read: if isMember(roomId)
+            && notBlockedByEitherUser(uid);
+          allow create: if signedIn()
+            && request.auth.uid == uid
+            && isPlayer(roomId)
+            && request.resource.data.senderUid == uid
+            && request.resource.data.visibility == 'room'
+            && request.resource.data.kind in ['message', 'answer', 'dare_result', 'game_prompt']
+            && (request.resource.data.kind == 'message' || get(roomPath(roomId)).data.status == 'active')
+            && request.resource.data.content is string
+            && request.resource.data.content.size() <= 2000
+            && request.resource.data.keys().hasOnly(['senderUid', 'senderName', 'kind', 'visibility', 'content', 'createdAt']);
+          allow update, delete: if false;
+        }
+
+        match /inboxFrom/{senderUid}/events/{eventId} {
+          allow read: if signedIn()
+            && request.auth.uid == uid
+            && isMember(roomId)
+            && notBlockedByEitherUser(senderUid);
+          allow create: if signedIn()
+            && isPlayer(roomId)
+            && request.auth.uid == senderUid
+            && request.resource.data.senderUid == request.auth.uid
+            && request.resource.data.visibility == 'selected'
+            && request.resource.data.content is string
+            && request.resource.data.content.size() <= 2000
+            && request.resource.data.keys().hasOnly(['senderUid', 'senderName', 'kind', 'visibility', 'content', 'createdAt'])
+            && exists(memberPath(roomId, uid))
+            && (request.resource.data.kind == 'message' || get(roomPath(roomId)).data.status == 'active')
+            && notBlockedByEitherUser(uid);
+          allow update, delete: if false;
+        }
+      }
+
+      match /invites/{uid} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        allow create: if isHost(roomId) && request.resource.data.uid == uid;
+        allow update, delete: if isHost(roomId);
+      }
+
+      match /bans/{uid} {
+        allow read: if isHost(roomId);
+        allow create: if isHost(roomId)
+          && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
+          && request.resource.data.uid == uid;
+        allow delete: if isHost(roomId);
+        allow update: if false;
+      }
+    }
+
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.reporterUid == request.auth.uid
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() <= 1000
+        && request.resource.data.keys().hasOnly(['reporterUid', 'reportedUid', 'roomId', 'reason', 'createdAt']);
+      allow read, update, delete: if false;
+    }
+  }
+}
